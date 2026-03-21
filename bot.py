@@ -94,12 +94,35 @@ class CopilotSession:
                            capture_output=True)
         return r.returncode == 0
 
-    def _get_latest_session_id(self) -> str:
-        """Return the most recently modified Copilot session ID."""
-        session_dir = Path.home() / '.copilot' / 'session-state'
-        jsonl_files = sorted(session_dir.glob('*.jsonl'), key=lambda p: p.stat().st_mtime, reverse=True)
-        if jsonl_files:
-            return jsonl_files[0].stem
+    def _get_terminal_session_id(self) -> str:
+        """Find session ID used by the non-bot, non-tmux copilot process in the terminal."""
+        try:
+            result = subprocess.run(
+                ['pgrep', '-a', '-f', 'copilot'],
+                capture_output=True, text=True
+            )
+            for line in result.stdout.splitlines():
+                # Skip bot's own tmux session and unrelated processes
+                if TMUX_SESSION in subprocess.run(
+                    ['tmux', 'list-panes', '-t', TMUX_SESSION, '-F', '#{pane_pid}'],
+                    capture_output=True, text=True
+                ).stdout:
+                    pass
+                # Look for --resume=<uuid> pattern in non-tmux copilot process
+                import re as _re
+                m = _re.search(r'--resume[= ]([0-9a-f-]{36})', line)
+                if m:
+                    sid = m.group(1)
+                    # Skip the bot's own session (started by tmux)
+                    tmux_pids = subprocess.run(
+                        ['tmux', 'list-panes', '-t', TMUX_SESSION, '-F', '#{pane_pid}'],
+                        capture_output=True, text=True
+                    ).stdout.split()
+                    pid = line.split()[0]
+                    if pid not in tmux_pids:
+                        return sid
+        except Exception as e:
+            print(f"[HANDOFF] error finding session: {e}", flush=True)
         return ''
 
     def start(self, resume_id: str = ''):
@@ -247,6 +270,8 @@ async def run_shell(cmd: str, timeout: int = 120) -> str:
 def code_block(text: str) -> str:
     return f'```\n{text}\n```'
 
+HANDOFF_FILE = Path.home() / '.copilot' / 'handoff-request'
+
 # ── Events ────────────────────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
@@ -259,6 +284,24 @@ async def on_ready():
 
     if ch:
         await ch.send(f'🤖 Copilot bot online on `{os.uname().nodename}` — session ready, just type to chat!')
+
+    # Start handoff file watcher
+    bot.loop.create_task(watch_handoff(ch))
+
+async def watch_handoff(ch):
+    """Watch for handoff-request file written by the terminal skill."""
+    print("[HANDOFF] watcher started", flush=True)
+    while True:
+        await asyncio.sleep(2)
+        if HANDOFF_FILE.exists():
+            session_id = HANDOFF_FILE.read_text().strip()
+            HANDOFF_FILE.unlink()
+            if session_id:
+                print(f"[HANDOFF] picking up session {session_id}", flush=True)
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, session.restart, session_id)
+                if ch:
+                    await ch.send(f'📲 Handoff received! Resumed session `{session_id[:8]}...` — continuing your conversation here.')
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -307,11 +350,19 @@ async def restart_cmd(ctx):
     await msg.edit(content='✅ Copilot session restarted!')
 
 @bot.command(name='handoff')
-async def handoff_cmd(ctx):
-    """Resume the most recent terminal Copilot session in Discord."""
-    session_id = session._get_latest_session_id()
+async def handoff_cmd(ctx, session_id: str = ''):
+    """Resume the terminal Copilot session in Discord.
+    Usage: !handoff           (auto-detect terminal session)
+           !handoff <id>      (specify session ID explicitly)
+    """
     if not session_id:
-        await ctx.send('❌ No Copilot sessions found in `~/.copilot/session-state/`')
+        session_id = session._get_terminal_session_id()
+    if not session_id:
+        await ctx.send(
+            '❌ Could not find terminal Copilot session.\n'
+            'Use `!handoff <session-id>` with the ID shown in your terminal.\n'
+            'Find it with: `pgrep -a -f copilot | grep resume`'
+        )
         return
     msg = await ctx.send(f'⏳ Handing off session `{session_id[:8]}...` to Discord...')
     loop = asyncio.get_event_loop()
