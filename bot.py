@@ -164,29 +164,54 @@ class CopilotSession:
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(None, self._ask_sync, question, timeout)
 
+    def _wait_for_input_ready(self, timeout: int = 15):
+        """Wait until Copilot is at the input prompt (not thinking, not loading)."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            out = self._capture()
+            # Ready = shows input prompt AND no spinner
+            if ('Type @' in out or 'shift+tab' in out) and 'Thinking' not in out and 'Loading' not in out:
+                return True
+            time.sleep(1)
+        return False
+
     def _ask_sync(self, question: str, timeout: int) -> str:
         if not self._session_exists():
             self.start()
 
-        # Snapshot pane before sending to detect new content
-        before = self._capture()
-        print(f"[ASK] sending: {question!r}", flush=True)
+        # Wait until Copilot is actually at the input prompt
+        self._wait_for_input_ready(timeout=20)
 
-        # Send message
-        self._tmux('send-keys', '-t', TMUX_SESSION, question, 'Enter')
+        # Snapshot line count before sending (used to isolate new response)
+        before_lines = len(self._capture().split('\n'))
+        print(f"[ASK] sending: {question!r} (before_lines={before_lines})", flush=True)
 
-        # Wait until Copilot starts thinking (confirms message was received)
-        think_deadline = time.time() + 10
+        # Send text then Enter as separate commands with small delay
+        self._tmux('send-keys', '-t', TMUX_SESSION, question)
+        time.sleep(0.3)
+        self._tmux('send-keys', '-t', TMUX_SESSION, '', 'Enter')
+
+        # Wait until Copilot starts thinking (confirms submission)
+        think_deadline = time.time() + 15
+        got_thinking = False
         while time.time() < think_deadline:
             time.sleep(1)
             out = self._capture()
             if 'Thinking' in out:
                 print("[ASK] copilot is thinking...", flush=True)
+                got_thinking = True
                 break
+            # If message is still in input box (not submitted), send Enter again
+            if question[:10] in out and 'ctrl+s' in out and not got_thinking:
+                print("[ASK] message still in input, retrying Enter...", flush=True)
+                self._tmux('send-keys', '-t', TMUX_SESSION, '', 'Enter')
 
-        # Now wait until Thinking disappears AND output is stable
+        if not got_thinking:
+            print("[ASK] WARNING: Copilot never started thinking", flush=True)
+
+        # Wait until Thinking disappears AND output is stable (= response complete)
         deadline = time.time() + timeout
-        last_out = ''
+        last_out = self._capture()
         stable_since = None
 
         while time.time() < deadline:
@@ -206,46 +231,37 @@ class CopilotSession:
                     break
 
         print(f"[ASK] pane (last 800): {last_out[-800:]!r}", flush=True)
-        response = self._extract_response(before, last_out, question)
+        response = self._extract_response(before_lines, last_out, question)
         print(f"[ASK] extracted: {response!r}", flush=True)
         if len(response) > 1800:
             response = response[:1800] + '\n...(truncated)'
         return response or '(no response captured)'
 
-    def _extract_response(self, before: str, after: str, question: str) -> str:
-        """Extract only the new AI response lines added after the question."""
-        lines = after.split('\n')
+    def _extract_response(self, before_lines: int, after: str, question: str) -> str:
+        """Extract new response lines that appeared after the question was sent.
+        Uses line-count offset to avoid picking up conversation history.
+        """
+        all_lines = after.split('\n')
+        # Only consider lines that appeared after 'before_lines' snapshot
+        # The pane shows ~50 lines, so new content is near the bottom
+        new_lines = all_lines[max(0, before_lines - 5):]  # small overlap for safety
+
         result = []
-        # Find where the user's question appears, take content after it
-        found_q = False
-        for line in lines:
+        for line in new_lines:
             stripped = line.strip()
-            if not found_q:
-                if question[:20] in line:
-                    found_q = True
-                continue
             if not stripped:
                 continue
             if _STATUS_LINE.search(stripped):
                 continue
             if _DIVIDER.match(stripped):
                 continue
-            stripped = re.sub(r'^[●◉◎○◐◑◒◓▸▹►▻•·❯~\s]+', '', stripped).strip()
+            # Skip if it's the user's own question echoed back
+            if question[:15] in stripped:
+                continue
+            stripped = re.sub(r'^[●◉◎○◐◑◒◓▸▹►▻•·❯~\s│╭╰╮╯]+', '', stripped).strip()
             if not stripped:
                 continue
             result.append(stripped)
-
-        if not result:
-            # Fallback: just return non-UI lines from after
-            for line in lines:
-                stripped = re.sub(r'^[●◉◎○◐◑◒◓▸▹►▻•·❯~\s]+', '', line.strip()).strip()
-                if not stripped:
-                    continue
-                if _STATUS_LINE.search(stripped):
-                    continue
-                if _DIVIDER.match(stripped):
-                    continue
-                result.append(stripped)
 
         return '\n'.join(result).strip()
 
