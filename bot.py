@@ -172,12 +172,21 @@ class CopilotSession:
         before = self._capture()
         print(f"[ASK] sending: {question!r}", flush=True)
 
-        # Send message (escape special chars for tmux)
+        # Send message
         self._tmux('send-keys', '-t', TMUX_SESSION, question, 'Enter')
 
-        # Poll until response appears and copilot goes idle
+        # Wait until Copilot starts thinking (confirms message was received)
+        think_deadline = time.time() + 10
+        while time.time() < think_deadline:
+            time.sleep(1)
+            out = self._capture()
+            if 'Thinking' in out:
+                print("[ASK] copilot is thinking...", flush=True)
+                break
+
+        # Now wait until Thinking disappears AND output is stable
         deadline = time.time() + timeout
-        last_out = before
+        last_out = ''
         stable_since = None
 
         while time.time() < deadline:
@@ -191,10 +200,9 @@ class CopilotSession:
                 last_out = out
                 stable_since = None
             elif is_idle:
-                # Output stable + copilot idle → done
                 if stable_since is None:
                     stable_since = time.time()
-                elif time.time() - stable_since > 2:
+                elif time.time() - stable_since > 3:
                     break
 
         print(f"[ASK] pane (last 800): {last_out[-800:]!r}", flush=True)
