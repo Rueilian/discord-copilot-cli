@@ -94,14 +94,26 @@ class CopilotSession:
                            capture_output=True)
         return r.returncode == 0
 
-    def start(self):
+    def _get_latest_session_id(self) -> str:
+        """Return the most recently modified Copilot session ID."""
+        session_dir = Path.home() / '.copilot' / 'session-state'
+        jsonl_files = sorted(session_dir.glob('*.jsonl'), key=lambda p: p.stat().st_mtime, reverse=True)
+        if jsonl_files:
+            return jsonl_files[0].stem
+        return ''
+
+    def start(self, resume_id: str = ''):
         if self._session_exists():
             self._tmux('kill-session', '-t', TMUX_SESSION)
             time.sleep(1)
+        # Build command — optionally resume a specific session
+        cmd = COPILOT_CMD
+        if resume_id:
+            cmd = f'{COPILOT_CMD} --resume={resume_id}'
         # Create detached tmux session and start copilot
         self._tmux('new-session', '-d', '-s', TMUX_SESSION, '-x', '220', '-y', '50')
-        self._tmux('send-keys', '-t', TMUX_SESSION, COPILOT_CMD, 'Enter')
-        print("[COPILOT] tmux session started, waiting for environment...", flush=True)
+        self._tmux('send-keys', '-t', TMUX_SESSION, cmd, 'Enter')
+        print(f"[COPILOT] tmux session started: {cmd}", flush=True)
 
         # Wait for environment to load (up to 40s)
         deadline = time.time() + 40
@@ -120,9 +132,9 @@ class CopilotSession:
         else:
             self.ready = True  # proceed anyway
 
-    def restart(self):
+    def restart(self, resume_id: str = ''):
         self.ready = False
-        self.start()
+        self.start(resume_id=resume_id)
 
     async def ask(self, question: str, timeout: int = 60) -> str:
         async with self.lock:
@@ -283,7 +295,8 @@ async def help_cmd(ctx):
         '`!log p0` — tail simulation log\n'
         '`!ls [path]` — list directory\n'
         '`!status` — host info\n'
-        '`!restart` — restart Copilot session\n'
+        '`!restart` — restart Copilot session (fresh)\n'
+        '`!handoff` — resume current terminal session here\n'
     )
 
 @bot.command(name='restart')
@@ -292,6 +305,18 @@ async def restart_cmd(ctx):
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, session.restart)
     await msg.edit(content='✅ Copilot session restarted!')
+
+@bot.command(name='handoff')
+async def handoff_cmd(ctx):
+    """Resume the most recent terminal Copilot session in Discord."""
+    session_id = session._get_latest_session_id()
+    if not session_id:
+        await ctx.send('❌ No Copilot sessions found in `~/.copilot/session-state/`')
+        return
+    msg = await ctx.send(f'⏳ Handing off session `{session_id[:8]}...` to Discord...')
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, session.restart, session_id)
+    await msg.edit(content=f'✅ Resumed session `{session_id[:8]}...` — conversation history carried over!')
 
 @bot.command(name='run')
 async def run_cmd(ctx, *, cmd: str):
