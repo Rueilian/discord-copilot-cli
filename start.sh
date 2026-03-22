@@ -1,7 +1,7 @@
 #!/bin/bash
 # start.sh — start the bot in the background
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-LOG="$HOME/discord-copilot-cli.log"
+LOG="$HOME/discord_bot.log"
 
 # Kill any existing instance
 EXISTING=$(pgrep -f "python.*bot.py" 2>/dev/null | head -1)

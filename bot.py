@@ -86,44 +86,30 @@ class CopilotSession:
         return result.stdout
 
     def _capture(self) -> str:
+        """Capture current visible tmux pane (strips ANSI)."""
         raw = self._tmux('capture-pane', '-t', TMUX_SESSION, '-p', '-e')
+        return strip_ansi(raw)
+
+    PIPE_FILE = Path('/tmp/copilot-discord-pipe.txt')
+
+    def _pipe_start(self):
+        """Start piping ALL new terminal output to PIPE_FILE."""
+        self.PIPE_FILE.unlink(missing_ok=True)
+        self._tmux('pipe-pane', '-t', TMUX_SESSION, '-o', f'cat >> {self.PIPE_FILE}')
+
+    def _pipe_stop(self) -> str:
+        """Stop piping and return accumulated output (stripped of ANSI)."""
+        self._tmux('pipe-pane', '-t', TMUX_SESSION)  # stop pipe
+        try:
+            raw = self.PIPE_FILE.read_text(errors='replace')
+        except FileNotFoundError:
+            raw = ''
         return strip_ansi(raw)
 
     def _session_exists(self) -> bool:
         r = subprocess.run(['tmux', 'has-session', '-t', TMUX_SESSION],
                            capture_output=True)
         return r.returncode == 0
-
-    def _get_terminal_session_id(self) -> str:
-        """Find session ID used by the non-bot, non-tmux copilot process in the terminal."""
-        try:
-            result = subprocess.run(
-                ['pgrep', '-a', '-f', 'copilot'],
-                capture_output=True, text=True
-            )
-            for line in result.stdout.splitlines():
-                # Skip bot's own tmux session and unrelated processes
-                if TMUX_SESSION in subprocess.run(
-                    ['tmux', 'list-panes', '-t', TMUX_SESSION, '-F', '#{pane_pid}'],
-                    capture_output=True, text=True
-                ).stdout:
-                    pass
-                # Look for --resume=<uuid> pattern in non-tmux copilot process
-                import re as _re
-                m = _re.search(r'--resume[= ]([0-9a-f-]{36})', line)
-                if m:
-                    sid = m.group(1)
-                    # Skip the bot's own session (started by tmux)
-                    tmux_pids = subprocess.run(
-                        ['tmux', 'list-panes', '-t', TMUX_SESSION, '-F', '#{pane_pid}'],
-                        capture_output=True, text=True
-                    ).stdout.split()
-                    pid = line.split()[0]
-                    if pid not in tmux_pids:
-                        return sid
-        except Exception as e:
-            print(f"[HANDOFF] error finding session: {e}", flush=True)
-        return ''
 
     def start(self, resume_id: str = ''):
         if self._session_exists():
@@ -133,8 +119,8 @@ class CopilotSession:
         cmd = COPILOT_CMD
         if resume_id:
             cmd = f'{COPILOT_CMD} --resume={resume_id}'
-        # Create detached tmux session and start copilot
-        self._tmux('new-session', '-d', '-s', TMUX_SESSION, '-x', '220', '-y', '50')
+        # Create detached tmux session — tall pane (500 lines) so responses don't scroll off
+        self._tmux('new-session', '-d', '-s', TMUX_SESSION, '-x', '220', '-y', '500')
         self._tmux('send-keys', '-t', TMUX_SESSION, cmd, 'Enter')
         print(f"[COPILOT] tmux session started: {cmd}", flush=True)
 
@@ -164,41 +150,50 @@ class CopilotSession:
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(None, self._ask_sync, question, timeout)
 
-    def _wait_for_input_ready(self, timeout: int = 15):
-        """Wait until Copilot is at the input prompt (not thinking, not loading)."""
+    def _wait_for_input_ready(self, timeout: int = 30):
+        """Wait until Copilot is at the input prompt (not actively thinking)."""
         deadline = time.time() + timeout
         while time.time() < deadline:
+            # Only check the bottom portion of the pane (status area)
+            # to avoid false positives from conversation history
             out = self._capture()
-            # Ready = shows input prompt AND no spinner
-            if ('Type @' in out or 'shift+tab' in out) and 'Thinking' not in out and 'Loading' not in out:
+            lines = out.split('\n')
+            bottom = '\n'.join(lines[-10:])  # last 10 lines = status bar area
+            # Ready = input box visible AND no active Thinking spinner in status area
+            has_prompt = 'Type @' in bottom or 'shift+tab' in bottom
+            is_thinking = 'Thinking' in bottom
+            if has_prompt and not is_thinking:
                 return True
-            time.sleep(1)
+            time.sleep(0.5)
         return False
 
     def _ask_sync(self, question: str, timeout: int) -> str:
+        t0 = time.time()
         if not self._session_exists():
             self.start()
 
         # Wait until Copilot is actually at the input prompt
         self._wait_for_input_ready(timeout=20)
+        print(f"[ASK] ready_wait={time.time()-t0:.1f}s sending: {question!r}", flush=True)
 
-        # Snapshot line count before sending (used to isolate new response)
-        before_lines = len(self._capture().split('\n'))
-        print(f"[ASK] sending: {question!r} (before_lines={before_lines})", flush=True)
+        # Start capturing ALL new output to pipe file (avoids history contamination)
+        self._pipe_start()
 
         # Send text then Enter as separate commands with small delay
         self._tmux('send-keys', '-t', TMUX_SESSION, question)
         time.sleep(0.3)
         self._tmux('send-keys', '-t', TMUX_SESSION, '', 'Enter')
 
-        # Wait until Copilot starts thinking (confirms submission)
+        # Wait until Copilot starts thinking (confirms submission) — check bottom only
         think_deadline = time.time() + 15
         got_thinking = False
         while time.time() < think_deadline:
-            time.sleep(1)
+            time.sleep(0.5)
             out = self._capture()
-            if 'Thinking' in out:
-                print("[ASK] copilot is thinking...", flush=True)
+            lines = out.split('\n')
+            bottom = '\n'.join(lines[-10:])
+            if 'Thinking' in bottom:
+                print(f"[ASK] thinking at {time.time()-t0:.1f}s", flush=True)
                 got_thinking = True
                 break
             # If message is still in input box (not submitted), send Enter again
@@ -207,59 +202,172 @@ class CopilotSession:
                 self._tmux('send-keys', '-t', TMUX_SESSION, '', 'Enter')
 
         if not got_thinking:
-            print("[ASK] WARNING: Copilot never started thinking", flush=True)
+            print(f"[ASK] WARNING: never saw Thinking at {time.time()-t0:.1f}s", flush=True)
 
-        # Wait until Thinking disappears AND output is stable (= response complete)
+        # Wait until Thinking disappears from the status area
         deadline = time.time() + timeout
-        last_out = self._capture()
-        stable_since = None
 
         while time.time() < deadline:
-            time.sleep(2)
+            time.sleep(0.5)
             out = self._capture()
+            lines = out.split('\n')
+            bottom = '\n'.join(lines[-10:])
+            is_thinking = 'Thinking' in bottom
+            is_idle = ('Type @' in bottom or 'shift+tab' in bottom) and not is_thinking
+            if is_idle:
+                time.sleep(0.3)  # brief pause to let final render complete
+                break
 
-            is_thinking = 'Thinking' in out
-            is_idle = ('Type @' in out or 'shift+tab' in out) and not is_thinking
+        print(f"[ASK] done at {time.time()-t0:.1f}s", flush=True)
 
-            if out != last_out:
-                last_out = out
-                stable_since = None
-            elif is_idle:
-                if stable_since is None:
-                    stable_since = time.time()
-                elif time.time() - stable_since > 3:
-                    break
+        # Stop pipe (was capturing raw ANSI — not useful) and use capture-pane instead
+        self._pipe_stop()
 
-        print(f"[ASK] pane (last 800): {last_out[-800:]!r}", flush=True)
-        response = self._extract_response(before_lines, last_out, question)
-        print(f"[ASK] extracted: {response!r}", flush=True)
+        # Capture visible pane and extract only the latest ● response bubble
+        pane = self._capture()
+        response = self._extract_from_pane(pane)
+        print(f"[ASK] extracted: {response[:80]!r}", flush=True)
         if len(response) > 1800:
             response = response[:1800] + '\n...(truncated)'
         return response or '(no response captured)'
 
-    def _extract_response(self, before_lines: int, after: str, question: str) -> str:
-        """Extract new response lines that appeared after the question was sent.
-        Uses line-count offset to avoid picking up conversation history.
+    def _extract_response(self, after: str, question: str) -> str:
+        """Extract AI response from visible pane content.
+        Structure: [conversation] [divider] [input box] [divider] [status bar]
+        Response is ABOVE the first divider from the bottom.
         """
         all_lines = after.split('\n')
-        # Only consider lines that appeared after 'before_lines' snapshot
-        # The pane shows ~50 lines, so new content is near the bottom
-        new_lines = all_lines[max(0, before_lines - 5):]  # small overlap for safety
+        # Find the first divider from the bottom (= top of input box)
+        first_divider_from_bottom = None
+        for i in range(len(all_lines) - 1, -1, -1):
+            if _DIVIDER.match(all_lines[i].strip()):
+                first_divider_from_bottom = i
+                break
+
+        if first_divider_from_bottom is not None:
+            content_lines = all_lines[:first_divider_from_bottom]
+        else:
+            content_lines = all_lines
+
+        # Find where the user's question is — search BACKWARDS to get the LAST occurrence
+        # (resume sessions show full history; we want the freshly-sent question near the bottom)
+        q_short = question[:20]
+        q_idx = None
+        for i in range(len(content_lines) - 1, -1, -1):
+            l = content_lines[i]
+            if q_short in l and ('❯' in l or '>' in l):
+                q_idx = i
+                break
+        if q_idx is not None:
+            content_lines = content_lines[q_idx + 1:]
+        else:
+            # Fallback: take only the last 30 lines (fresh response area)
+            content_lines = content_lines[-30:]
+
+        # Find the LAST ● response bubble after the question
+        # Copilot responses start with ● on their own line
+        # Anything before the first ● is "thinking" text — skip it
+        bubble_start = None
+        for i, l in enumerate(content_lines):
+            if re.match(r'^[●◉◎○◐◑◒◓]\s', l.strip()) or l.strip().startswith('●'):
+                bubble_start = i
+        if bubble_start is not None:
+            content_lines = content_lines[bubble_start:]
 
         result = []
-        for line in new_lines:
+        for line in content_lines:
             stripped = line.strip()
             if not stripped:
+                result.append('')  # preserve blank lines in response
                 continue
             if _STATUS_LINE.search(stripped):
                 continue
             if _DIVIDER.match(stripped):
                 continue
-            # Skip if it's the user's own question echoed back
-            if question[:15] in stripped:
-                continue
-            stripped = re.sub(r'^[●◉◎○◐◑◒◓▸▹►▻•·❯~\s│╭╰╮╯]+', '', stripped).strip()
+            # Strip box-drawing and spinner prefix chars
+            stripped = re.sub(r'^[●◉◎○◐◑◒◓▸▹►▻•·❯~\s│╭╰╮╯─]+', '', stripped).strip()
             if not stripped:
+                continue
+            # Skip lines that are just box borders
+            if re.match(r'^[╭╮╰╯│─\s]+$', stripped):
+                continue
+            result.append(stripped)
+
+        return '\n'.join(result).strip()
+
+    def _extract_from_pipe(self, raw: str) -> str:
+        """Extract AI response from pipe-pane output (new output only, no history).
+        Looks for the last ● response bubble in the piped content.
+        """
+        lines = raw.split('\n')
+        # Find the LAST ● bubble start
+        bubble_start = None
+        for i, l in enumerate(lines):
+            s = l.strip()
+            if re.match(r'^[●◉◎○◐◑◒◓]\s', s) or s.startswith('●'):
+                bubble_start = i
+        if bubble_start is not None:
+            lines = lines[bubble_start:]
+
+        result = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                result.append('')
+                continue
+            if _STATUS_LINE.search(stripped):
+                continue
+            if _DIVIDER.match(stripped):
+                break  # stop at input box divider
+            # Strip spinner/box prefix chars
+            stripped = re.sub(r'^[●◉◎○◐◑◒◓▸▹►▻•·❯~\s│╭╰╮╯─]+', '', stripped).strip()
+            if not stripped:
+                continue
+            if re.match(r'^[╭╮╰╯│─\s]+$', stripped):
+                continue
+            result.append(stripped)
+
+        return '\n'.join(result).strip()
+
+    def _extract_from_pane(self, pane: str) -> str:
+        """Extract the LAST AI response bubble from the visible pane.
+        Finds the last ● line above the input box divider.
+        """
+        lines = pane.split('\n')
+
+        # Find the first divider from bottom (top edge of input box)
+        divider_idx = None
+        for i in range(len(lines) - 1, -1, -1):
+            if _DIVIDER.match(lines[i].strip()):
+                divider_idx = i
+                break
+
+        content_lines = lines[:divider_idx] if divider_idx is not None else lines
+
+        # Find the LAST ● bubble in content
+        bubble_start = None
+        for i, l in enumerate(content_lines):
+            s = l.strip()
+            if re.match(r'^[●◉◎○◐◑◒◓]', s):
+                bubble_start = i
+
+        if bubble_start is None:
+            return ''
+
+        result = []
+        for line in content_lines[bubble_start:]:
+            stripped = line.strip()
+            if not stripped:
+                result.append('')
+                continue
+            if _STATUS_LINE.search(stripped):
+                continue
+            if _DIVIDER.match(stripped):
+                break
+            stripped = re.sub(r'^[●◉◎○◐◑◒◓▸▹►▻•·❯~\s│╭╰╮╯─]+', '', stripped).strip()
+            if not stripped:
+                continue
+            if re.match(r'^[╭╮╰╯│─\s]+$', stripped):
                 continue
             result.append(stripped)
 
@@ -294,38 +402,18 @@ async def run_shell(cmd: str, timeout: int = 120) -> str:
 def code_block(text: str) -> str:
     return f'```\n{text}\n```'
 
-HANDOFF_FILE = Path.home() / '.copilot' / 'handoff-request'
-
 # ── Events ────────────────────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
     ch = bot.get_channel(CHANNEL_ID)
     print(f'✅ Bot ready as {bot.user}')
 
-    # Start Copilot session in background thread
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, session.start)
-
     if ch:
-        await ch.send(f'🤖 Copilot bot online on `{os.uname().nodename}` — session ready, just type to chat!')
-
-    # Start handoff file watcher
-    bot.loop.create_task(watch_handoff(ch))
-
-async def watch_handoff(ch):
-    """Watch for handoff-request file written by the terminal skill."""
-    print("[HANDOFF] watcher started", flush=True)
-    while True:
-        await asyncio.sleep(2)
-        if HANDOFF_FILE.exists():
-            session_id = HANDOFF_FILE.read_text().strip()
-            HANDOFF_FILE.unlink()
-            if session_id:
-                print(f"[HANDOFF] picking up session {session_id}", flush=True)
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, session.restart, session_id)
-                if ch:
-                    await ch.send(f'📲 Handoff received! Resumed session `{session_id[:8]}...` — continuing your conversation here.')
+        await ch.send(
+            f'🤖 Copilot bot online on `{os.uname().nodename}`\n'
+            f'Type `!start` to start a new session, or `!handoff` to resume the most recent one.\n'
+            f'Type `!help` for all commands.'
+        )
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -346,7 +434,7 @@ async def on_message(message: discord.Message):
         return
 
     async with message.channel.typing():
-        response = await session.ask(question, timeout=60)
+        response = await session.ask(question, timeout=900)  # 15 minutes
 
     await message.reply(response)
 
@@ -355,15 +443,12 @@ async def on_message(message: discord.Message):
 async def help_cmd(ctx):
     await ctx.send(
         '**Copilot Bot**\n'
-        'Just type normally to chat with Copilot.\n\n'
-        '**Shell commands:**\n'
-        '`!run <cmd>` — run shell command\n'
-        '`!sim p0 [p1 ...]` — run ADFP VCS simulation\n'
-        '`!log p0` — tail simulation log\n'
-        '`!ls [path]` — list directory\n'
-        '`!status` — host info\n'
+        'Just type normally to chat with Copilot CLI.\n\n'
+        '**Session commands:**\n'
+        '`!start` — start a new Copilot session\n'
+        '`!exit` — close the current Copilot session\n'
         '`!restart` — restart Copilot session (fresh)\n'
-        '`!handoff` — resume current terminal session here\n'
+        '`!handoff` — resume the most recent session\n\n'
     )
 
 @bot.command(name='restart')
@@ -373,63 +458,43 @@ async def restart_cmd(ctx):
     await loop.run_in_executor(None, session.restart)
     await msg.edit(content='✅ Copilot session restarted!')
 
+@bot.command(name='start')
+async def start_cmd(ctx):
+    """Start a new fresh Copilot session."""
+    msg = await ctx.send('⏳ Starting new Copilot session...')
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, session.restart)
+    await msg.edit(content='✅ New Copilot session started — you can chat now!')
+
+@bot.command(name='exit')
+async def exit_cmd(ctx):
+    """Close the current Copilot session (tmux session killed)."""
+    if session._session_exists():
+        session._tmux('kill-session', '-t', TMUX_SESSION)
+        session.ready = False
+        await ctx.send('✅ Copilot session closed.')
+    else:
+        await ctx.send('ℹ️ No active session to close.')
+
 @bot.command(name='handoff')
 async def handoff_cmd(ctx, session_id: str = ''):
-    """Resume the terminal Copilot session in Discord.
-    Usage: !handoff           (auto-detect terminal session)
-           !handoff <id>      (specify session ID explicitly)
+    """Resume the most recent Copilot session (or a specific one by ID).
+    Usage: !handoff              — auto-pick latest session
+           !handoff <session-id> — specify session ID explicitly
     """
     if not session_id:
-        session_id = session._get_terminal_session_id()
-    if not session_id:
-        await ctx.send(
-            '❌ Could not find terminal Copilot session.\n'
-            'Use `!handoff <session-id>` with the ID shown in your terminal.\n'
-            'Find it with: `pgrep -a -f copilot | grep resume`'
+        # Find the most recently modified session directory
+        result = await run_shell(
+            'ls -t ~/.copilot/session-state/ 2>/dev/null | head -1', timeout=5
         )
+        session_id = result.strip()
+    if not session_id:
+        await ctx.send('❌ No sessions found in `~/.copilot/session-state/`')
         return
-    msg = await ctx.send(f'⏳ Handing off session `{session_id[:8]}...` to Discord...')
+    msg = await ctx.send(f'⏳ Resuming session `{session_id[:8]}...` — please wait...')
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, session.restart, session_id)
     await msg.edit(content=f'✅ Resumed session `{session_id[:8]}...` — conversation history carried over!')
-
-@bot.command(name='run')
-async def run_cmd(ctx, *, cmd: str):
-    msg = await ctx.send(f'⏳ Running: `{cmd}`')
-    output = await run_shell(cmd, timeout=120)
-    await msg.edit(content=f'✅ `{cmd}`\n{code_block(output)}')
-
-@bot.command(name='sim')
-async def sim_cmd(ctx, *patterns: str):
-    if not patterns:
-        await ctx.send('Usage: `!sim p0 [p1 p2 p3 p4]`')
-        return
-    rtl_dir = '~/1142_hw1/01_RTL'
-    await ctx.send(f'⏳ Running: `{" ".join(patterns)}`')
-    await run_shell(f'cd {rtl_dir} && cb', timeout=15)
-    for pat in patterns:
-        msg = await ctx.send(f'⏳ Simulating `{pat}`...')
-        await run_shell(f'tcsh {rtl_dir}/01_run {pat}', timeout=90)
-        log = f'{rtl_dir}/rtl_{pat}.log'
-        result = await run_shell(f'grep -E "ALL PASS|FAIL|Total Errors" {log} | tail -3', timeout=5)
-        icon = '✅' if 'ALL PASS' in result else '❌'
-        await msg.edit(content=f'{icon} `{pat}`: {result}')
-
-@bot.command(name='log')
-async def log_cmd(ctx, pattern: str = 'p0'):
-    log = f'~/1142_hw1/01_RTL/rtl_{pattern}.log'
-    output = await run_shell(f'tail -30 {log}', timeout=5)
-    await ctx.send(f'📄 `{log}` (tail)\n{code_block(output)}')
-
-@bot.command(name='ls')
-async def ls_cmd(ctx, path: str = '~/1142_hw1'):
-    output = await run_shell(f'ls -la {path}', timeout=5)
-    await ctx.send(code_block(output))
-
-@bot.command(name='status')
-async def status_cmd(ctx):
-    output = await run_shell('uname -n && whoami && date', timeout=5)
-    await ctx.send(f'🖥️ Host info:\n{code_block(output)}')
 
 # ── Run ───────────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
