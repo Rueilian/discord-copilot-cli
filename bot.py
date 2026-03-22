@@ -46,7 +46,7 @@ COPILOT_CMD = "copilot --yolo"
 # ── ANSI / output cleanup ─────────────────────────────────────────────────────
 _ANSI = re.compile(r'(\x9B|\x1B\[)[0-9:;<=>?]*[ -/]*[@-~]|\x1B[@-_]|\x1b\].*?\x07|\r')
 _STATUS_LINE = re.compile(
-    r'(Thinking|Loading environment|Environment loaded|shift\+tab|Remaining reqs\.|ctrl\+[sq]|enqueue|switch mode|Type @|claude-sonnet|claude-opus|gpt-|medium|MCP server)'
+    r'(Thinking|Loading environment|Environment loaded|shift\+tab|Remaining reqs\.|ctrl\+[sq]|enqueue|switch mode|Type @|claude-sonnet|claude-opus|gpt-|medium|MCP server|Esc to cancel|to cancel)'
 )
 _DIVIDER = re.compile(r'^[─╭╰│╮╯\s]+$')
 
