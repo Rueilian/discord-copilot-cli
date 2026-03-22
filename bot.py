@@ -90,22 +90,6 @@ class CopilotSession:
         raw = self._tmux('capture-pane', '-t', TMUX_SESSION, '-p', '-e')
         return strip_ansi(raw)
 
-    PIPE_FILE = Path('/tmp/copilot-discord-pipe.txt')
-
-    def _pipe_start(self):
-        """Start piping ALL new terminal output to PIPE_FILE."""
-        self.PIPE_FILE.unlink(missing_ok=True)
-        self._tmux('pipe-pane', '-t', TMUX_SESSION, '-o', f'cat >> {self.PIPE_FILE}')
-
-    def _pipe_stop(self) -> str:
-        """Stop piping and return accumulated output (stripped of ANSI)."""
-        self._tmux('pipe-pane', '-t', TMUX_SESSION)  # stop pipe
-        try:
-            raw = self.PIPE_FILE.read_text(errors='replace')
-        except FileNotFoundError:
-            raw = ''
-        return strip_ansi(raw)
-
     def _session_exists(self) -> bool:
         r = subprocess.run(['tmux', 'has-session', '-t', TMUX_SESSION],
                            capture_output=True)
@@ -227,84 +211,8 @@ class CopilotSession:
             response = response[:1800] + '\n...(truncated)'
         return response or '(no response captured)'
 
-    def _extract_response(self, after: str, question: str) -> str:
-        """Extract AI response from visible pane content.
-        Structure: [conversation] [divider] [input box] [divider] [status bar]
-        Response is ABOVE the first divider from the bottom.
-        """
-        all_lines = after.split('\n')
-        # Find the first divider from the bottom (= top of input box)
-        first_divider_from_bottom = None
-        for i in range(len(all_lines) - 1, -1, -1):
-            if _DIVIDER.match(all_lines[i].strip()):
-                first_divider_from_bottom = i
-                break
-
-        if first_divider_from_bottom is not None:
-            content_lines = all_lines[:first_divider_from_bottom]
-        else:
-            content_lines = all_lines
-
-        # Find where the user's question is — search BACKWARDS to get the LAST occurrence
-        # (resume sessions show full history; we want the freshly-sent question near the bottom)
-        q_short = question[:20]
-        q_idx = None
-        for i in range(len(content_lines) - 1, -1, -1):
-            l = content_lines[i]
-            if q_short in l and ('❯' in l or '>' in l):
-                q_idx = i
-                break
-        if q_idx is not None:
-            content_lines = content_lines[q_idx + 1:]
-        else:
-            # Fallback: take only the last 30 lines (fresh response area)
-            content_lines = content_lines[-30:]
-
-        # Find the LAST ● response bubble after the question
-        # Copilot responses start with ● on their own line
-        # Anything before the first ● is "thinking" text — skip it
-        bubble_start = None
-        for i, l in enumerate(content_lines):
-            if re.match(r'^[●◉◎○◐◑◒◓]\s', l.strip()) or l.strip().startswith('●'):
-                bubble_start = i
-        if bubble_start is not None:
-            content_lines = content_lines[bubble_start:]
-
-        result = []
-        for line in content_lines:
-            stripped = line.strip()
-            if not stripped:
-                result.append('')  # preserve blank lines in response
-                continue
-            if _STATUS_LINE.search(stripped):
-                continue
-            if _DIVIDER.match(stripped):
-                continue
-            # Strip box-drawing and spinner prefix chars
-            stripped = re.sub(r'^[●◉◎○◐◑◒◓▸▹►▻•·❯~\s│╭╰╮╯─]+', '', stripped).strip()
-            if not stripped:
-                continue
-            # Skip lines that are just box borders
-            if re.match(r'^[╭╮╰╯│─\s]+$', stripped):
-                continue
-            result.append(stripped)
-
-        return '\n'.join(result).strip()
-
-    def _extract_from_pipe(self, raw: str) -> str:
-        """Extract AI response from pipe-pane output (new output only, no history).
-        Looks for the last ● response bubble in the piped content.
-        """
-        lines = raw.split('\n')
-        # Find the LAST ● bubble start
-        bubble_start = None
-        for i, l in enumerate(lines):
-            s = l.strip()
-            if re.match(r'^[●◉◎○◐◑◒◓]\s', s) or s.startswith('●'):
-                bubble_start = i
-        if bubble_start is not None:
-            lines = lines[bubble_start:]
-
+    def _clean_lines(self, lines: list) -> list:
+        """Strip status lines, box chars, and spinner prefixes from a list of lines."""
         result = []
         for line in lines:
             stripped = line.strip()
@@ -314,21 +222,14 @@ class CopilotSession:
             if _STATUS_LINE.search(stripped):
                 continue
             if _DIVIDER.match(stripped):
-                break  # stop at input box divider
-            # Strip spinner/box prefix chars
+                break
             stripped = re.sub(r'^[●◉◎○◐◑◒◓▸▹►▻•·❯~\s│╭╰╮╯─]+', '', stripped).strip()
-            if not stripped:
-                continue
-            if re.match(r'^[╭╮╰╯│─\s]+$', stripped):
-                continue
-            result.append(stripped)
-
-        return '\n'.join(result).strip()
+            if stripped and not re.match(r'^[╭╮╰╯│─\s]+$', stripped):
+                result.append(stripped)
+        return result
 
     def _extract_from_pane(self, pane: str) -> str:
-        """Extract the LAST AI response bubble from the visible pane.
-        Finds the last ● line above the input box divider.
-        """
+        """Extract the LAST AI response bubble from the visible pane."""
         lines = pane.split('\n')
 
         # Find the first divider from bottom (top edge of input box)
@@ -343,46 +244,12 @@ class CopilotSession:
         # Find the LAST ● bubble in content
         bubble_start = None
         for i, l in enumerate(content_lines):
-            s = l.strip()
-            if re.match(r'^[●◉◎○◐◑◒◓]', s):
+            if re.match(r'^[●◉◎○◐◑◒◓]', l.strip()):
                 bubble_start = i
 
-        if bubble_start is None:
-            # Fallback: no ● found, take last 20 lines of content
-            content_lines = content_lines[-20:]
-            result = []
-            for line in content_lines:
-                stripped = line.strip()
-                if not stripped:
-                    result.append('')
-                    continue
-                if _STATUS_LINE.search(stripped):
-                    continue
-                if _DIVIDER.match(stripped):
-                    continue
-                stripped = re.sub(r'^[●◉◎○◐◑◒◓▸▹►▻•·❯~\s│╭╰╮╯─]+', '', stripped).strip()
-                if stripped and not re.match(r'^[╭╮╰╯│─\s]+$', stripped):
-                    result.append(stripped)
-            return '\n'.join(result).strip()
-
-        result = []
-        for line in content_lines[bubble_start:]:
-            stripped = line.strip()
-            if not stripped:
-                result.append('')
-                continue
-            if _STATUS_LINE.search(stripped):
-                continue
-            if _DIVIDER.match(stripped):
-                break
-            stripped = re.sub(r'^[●◉◎○◐◑◒◓▸▹►▻•·❯~\s│╭╰╮╯─]+', '', stripped).strip()
-            if not stripped:
-                continue
-            if re.match(r'^[╭╮╰╯│─\s]+$', stripped):
-                continue
-            result.append(stripped)
-
-        return '\n'.join(result).strip()
+        # Fallback: no ● found — take last 20 lines
+        src = content_lines[bubble_start:] if bubble_start is not None else content_lines[-20:]
+        return '\n'.join(self._clean_lines(src)).strip()
 
 
 # ── Bot setup ─────────────────────────────────────────────────────────────────
@@ -413,6 +280,27 @@ async def run_shell(cmd: str, timeout: int = 120) -> str:
 def code_block(text: str) -> str:
     return f'```\n{text}\n```'
 
+HANDOFF_FILE = Path.home() / '.copilot' / 'handoff-request'
+
+async def watch_handoff_file():
+    """Watch for handoff requests written by handoff.py in the terminal."""
+    while True:
+        await asyncio.sleep(2)
+        if HANDOFF_FILE.exists():
+            try:
+                session_id = HANDOFF_FILE.read_text().strip()
+                HANDOFF_FILE.unlink()
+            except Exception:
+                continue
+            if not session_id:
+                continue
+            ch = bot.get_channel(CHANNEL_ID)
+            if ch:
+                msg = await ch.send(f'📲 Terminal handoff — resuming session `{session_id[:8]}...`')
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, session.restart, session_id)
+                await msg.edit(content=f'✅ Resumed session `{session_id[:8]}...` from terminal handoff!')
+
 # ── Events ────────────────────────────────────────────────────────────────────
 @bot.event
 async def on_ready():
@@ -424,6 +312,9 @@ async def on_ready():
         session._tmux('kill-session', '-t', TMUX_SESSION)
         session.ready = False
         print('[COPILOT] killed leftover tmux session on startup', flush=True)
+
+    # Start watching for terminal handoff requests
+    asyncio.ensure_future(watch_handoff_file())
 
     if ch:
         await ch.send(
