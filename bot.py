@@ -352,7 +352,22 @@ class CopilotSession:
                 bubble_start = i
 
         if bubble_start is None:
-            return ''
+            # Fallback: no ● found, take last 20 lines of content
+            content_lines = content_lines[-20:]
+            result = []
+            for line in content_lines:
+                stripped = line.strip()
+                if not stripped:
+                    result.append('')
+                    continue
+                if _STATUS_LINE.search(stripped):
+                    continue
+                if _DIVIDER.match(stripped):
+                    continue
+                stripped = re.sub(r'^[●◉◎○◐◑◒◓▸▹►▻•·❯~\s│╭╰╮╯─]+', '', stripped).strip()
+                if stripped and not re.match(r'^[╭╮╰╯│─\s]+$', stripped):
+                    result.append(stripped)
+            return '\n'.join(result).strip()
 
         result = []
         for line in content_lines[bubble_start:]:
@@ -408,10 +423,16 @@ async def on_ready():
     ch = bot.get_channel(CHANNEL_ID)
     print(f'✅ Bot ready as {bot.user}')
 
+    # Kill any leftover tmux session so direct typing starts fresh
+    if session._session_exists():
+        session._tmux('kill-session', '-t', TMUX_SESSION)
+        session.ready = False
+        print('[COPILOT] killed leftover tmux session on startup', flush=True)
+
     if ch:
         await ch.send(
             f'🤖 Copilot bot online on `{os.uname().nodename}`\n'
-            f'Type `!start` to start a new session, or `!handoff` to resume the most recent one.\n'
+            f'Directly type to start a fresh session, or `!handoff` to resume the most recent one.\n'
             f'Type `!help` for all commands.'
         )
 
@@ -445,9 +466,8 @@ async def help_cmd(ctx):
         '**Copilot Bot**\n'
         'Just type normally to chat with Copilot CLI.\n\n'
         '**Session commands:**\n'
-        '`!start` — start a new Copilot session\n'
         '`!exit` — close the current Copilot session\n'
-        '`!restart` — restart Copilot session (fresh)\n'
+        '`!restart` — start a fresh Copilot session (clears history)\n'
         '`!handoff` — resume the most recent session\n\n'
     )
 
@@ -458,13 +478,6 @@ async def restart_cmd(ctx):
     await loop.run_in_executor(None, session.restart)
     await msg.edit(content='✅ Copilot session restarted!')
 
-@bot.command(name='start')
-async def start_cmd(ctx):
-    """Start a new fresh Copilot session."""
-    msg = await ctx.send('⏳ Starting new Copilot session...')
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, session.restart)
-    await msg.edit(content='✅ New Copilot session started — you can chat now!')
 
 @bot.command(name='exit')
 async def exit_cmd(ctx):
