@@ -119,8 +119,8 @@ class CopilotSession:
         cmd = COPILOT_CMD
         if resume_id:
             cmd = f'{COPILOT_CMD} --resume={resume_id}'
-        # Create detached tmux session — tall pane (500 lines) so responses don't scroll off
-        self._tmux('new-session', '-d', '-s', TMUX_SESSION, '-x', '220', '-y', '500')
+        # Create detached tmux session starting from HOME
+        self._tmux('new-session', '-d', '-s', TMUX_SESSION, '-x', '220', '-y', '500', '-c', os.path.expanduser('~'))
         self._tmux('send-keys', '-t', TMUX_SESSION, cmd, 'Enter')
         print(f"[COPILOT] tmux session started: {cmd}", flush=True)
 
@@ -150,19 +150,18 @@ class CopilotSession:
             loop = asyncio.get_event_loop()
             return await loop.run_in_executor(None, self._ask_sync, question, timeout)
 
+    def _is_idle(self, bottom: str) -> bool:
+        """Return True if Copilot is idle (not actively generating a response)."""
+        return 'enqueue' not in bottom
+
     def _wait_for_input_ready(self, timeout: int = 30):
         """Wait until Copilot is at the input prompt (not actively thinking)."""
         deadline = time.time() + timeout
         while time.time() < deadline:
-            # Only check the bottom portion of the pane (status area)
-            # to avoid false positives from conversation history
             out = self._capture()
             lines = out.split('\n')
-            bottom = '\n'.join(lines[-10:])  # last 10 lines = status bar area
-            # Ready = input box visible AND no active Thinking spinner in status area
-            has_prompt = 'Type @' in bottom or 'shift+tab' in bottom
-            is_thinking = 'Thinking' in bottom
-            if has_prompt and not is_thinking:
+            bottom = '\n'.join(lines[-10:])
+            if self._is_idle(bottom):
                 return True
             time.sleep(0.5)
         return False
@@ -184,7 +183,7 @@ class CopilotSession:
         time.sleep(0.3)
         self._tmux('send-keys', '-t', TMUX_SESSION, '', 'Enter')
 
-        # Wait until Copilot starts thinking (confirms submission) — check bottom only
+        # Wait until Copilot starts thinking (enqueue appears) — confirms submission
         think_deadline = time.time() + 15
         got_thinking = False
         while time.time() < think_deadline:
@@ -192,7 +191,7 @@ class CopilotSession:
             out = self._capture()
             lines = out.split('\n')
             bottom = '\n'.join(lines[-10:])
-            if 'Thinking' in bottom:
+            if 'enqueue' in bottom or 'Thinking' in bottom:
                 print(f"[ASK] thinking at {time.time()-t0:.1f}s", flush=True)
                 got_thinking = True
                 break
@@ -202,19 +201,16 @@ class CopilotSession:
                 self._tmux('send-keys', '-t', TMUX_SESSION, '', 'Enter')
 
         if not got_thinking:
-            print(f"[ASK] WARNING: never saw Thinking at {time.time()-t0:.1f}s", flush=True)
+            print(f"[ASK] WARNING: never saw thinking at {time.time()-t0:.1f}s", flush=True)
 
-        # Wait until Thinking disappears from the status area
+        # Wait until enqueue disappears (= response complete)
         deadline = time.time() + timeout
-
         while time.time() < deadline:
             time.sleep(0.5)
             out = self._capture()
             lines = out.split('\n')
             bottom = '\n'.join(lines[-10:])
-            is_thinking = 'Thinking' in bottom
-            is_idle = ('Type @' in bottom or 'shift+tab' in bottom) and not is_thinking
-            if is_idle:
+            if self._is_idle(bottom):
                 time.sleep(0.3)  # brief pause to let final render complete
                 break
 
